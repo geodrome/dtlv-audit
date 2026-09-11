@@ -1,5 +1,7 @@
 # dtlv-audit
 
+>⚠️ **WARNING:**  Pre-alpha. Under active development. API can change at any time! Use at your own risk. 
+
 Durable transaction history and a queryable audit projection for
 [Datalevin](https://github.com/datalevin/datalevin).
 
