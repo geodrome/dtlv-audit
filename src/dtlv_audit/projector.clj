@@ -60,6 +60,13 @@
                        only. :tx/id is commit order and is authoritative for
                        sorting; wall clock is not."
               :db/valueType :db.type/long}
+   :tx/commit {:db/doc "tx id the commit this belonged to began at. Datalevin
+                        assigns an id per transact! and commits per
+                        with-transaction, so one commit may hold several txs;
+                        this is what says which. Equal to :tx/id for a write
+                        that was its own commit, so grouping by it needs no
+                        special case."
+               :db/valueType :db.type/long}
    :tx/datom {:db/doc "datom entities are immutable and belong to this tx alone,
                        hence isComponent: pull inlines them, retractEntity
                        cascades. :datom/tx survives the cascade if that ever
@@ -111,17 +118,24 @@
 (defn open
   "Opens an audit projection over `journal`.
 
-   :dir      audit DB directory — must not resolve to the journal's own
-   :strict?  defaults to the journal's. Governs :closed-schema? on the audit
-             DB, so it moves with the journal's own strictness unless you are
-             mid-migration.
+   :dir       audit DB directory — must not resolve to the journal's own
+   :strict?   defaults to the journal's. Governs :closed-schema? on the audit
+              DB, so it moves with the journal's own strictness unless you are
+              mid-migration.
 
-             Tightening later is loose-then-strict: declare everything the
-             journal already contains, `rebuild!`, then flip the flag. Note
-             that a value first written undeclared is stored under a different
-             encoding than the same value written after the type is declared,
-             so they will not compare equal — rebuilding after declaring
-             reconciles them.
+              Tightening later is loose-then-strict: declare everything the
+              journal already contains, `rebuild!`, then flip the flag. Note
+              that a value first written undeclared is stored under a different
+              encoding than the same value written after the type is declared,
+              so they will not compare equal — rebuilding after declaring
+              reconciles them.
+
+   :conn-opts extra options for the audit conn, as passed to d/get-conn.
+              Merged *under* :closed-schema?, which :strict? owns: the two
+              would otherwise be one setting with two sources, and a caller
+              passing :closed-schema? here would silently disagree with the
+              strictness the journal validates against. Everything else —
+              :auto-entity-time?, :validate-data?, sizing — is the caller's.
 
    The annotation vocabulary comes from the journal, so it is declared once
    and used three times: checked by journal/tx!, merged into the audit schema
@@ -129,7 +143,7 @@
 
    Does not take ownership of the journal or its connection; `close!` closes
    only what this opened."
-  [journal {:keys [dir strict?]}]
+  [journal {:keys [dir strict? conn-opts]}]
   (let [{:keys [annotations]} journal
         strict? (if (some? strict?) strict? (:strict? journal))]
     (when-let [bad (seq (filter (comp reserved-nses namespace) (keys annotations)))]
@@ -138,15 +152,15 @@
     ;; Two conns on one directory is a second LMDB env on one file, which LMDB
     ;; forbids. Caught here rather than at the composing layer so it holds for
     ;; anyone who assembles a journal and a projector by hand.
-    (when (same-dir? (:dir journal) dir)
+    (when (same-dir? (journal/dir journal) dir)
       (throw (ex-info "domain and audit DBs cannot share a directory"
-                      {:dir (:dir journal) :audit-dir dir})))
+                      {:dir (journal/dir journal) :audit-dir dir})))
     ;; rebuild! has to close and reopen the audit conn, so the projector holds
     ;; the recipe for opening it, and holds the conn itself by reference — a
     ;; projector already running keeps working across a rebuild.
     (let [open-audit #(d/get-conn dir
                                   (merge audit-schema annotations)
-                                  {:closed-schema? strict?})]
+                                  (assoc conn-opts :closed-schema? strict?))]
       {:journal    journal
        :audit      (atom (open-audit))
        :open-audit open-audit
@@ -177,8 +191,9 @@
   [audit-db]
   (or (:marker/last-tx (d/entity audit-db [:marker/name :projector])) -1))
 
-(defn- ->tx-entity [tx {:keys [tx-data tx-meta tx-timestamp new-attrs]}]
-  (cond-> (merge {:tx/id tx :tx/at tx-timestamp} tx-meta)
+(defn- ->tx-entity [tx {:keys [commit tx-data tx-meta tx-timestamp new-attrs]}]
+  ;; commit defaults to tx for entries written before the field existed.
+  (cond-> (merge {:tx/id tx :tx/at tx-timestamp :tx/commit (or commit tx)} tx-meta)
     (seq new-attrs) (assoc :tx/new-attrs new-attrs)
     (seq tx-data)   (assoc :tx/datom
                            (mapv (fn [[e a v added]]
@@ -336,10 +351,19 @@
    serializes drains, but the two would share the state atom and each stop fn
    would report the other stopped. Throws rather than allow it.
 
+   :thread-name names that thread, defaulting to \"audit-projector\". Worth
+   setting as soon as a process runs more than one — per tenant, per store —
+   since the name is all a thread dump, a profiler or a stuck-thread log line
+   has to say which projector is the one not moving. `status` answers that for
+   a projector you already hold; a thread name answers it for one you are
+   looking at from the outside.
+
    stop! returns true if the projector stopped, false if it was still draining
    after 10s. Only a stop that succeeded releases the slot — while a drain is
    still running, there is nothing safe to restart alongside."
-  [{:keys [state stopper] :as projector} & {:keys [interval-ms] :or {interval-ms 1000}}]
+  [{:keys [state stopper] :as projector}
+   & {:keys [interval-ms thread-name]
+      :or   {interval-ms 1000 thread-name "audit-projector"}}]
   (when-not (pos-int? interval-ms)
     (throw (ex-info "interval-ms must be a positive integer" {:interval-ms interval-ms})))
   (when-not (compare-and-set! stopper nil ::starting)
@@ -348,7 +372,7 @@
     (let [exec (Executors/newSingleThreadScheduledExecutor
                 (reify ThreadFactory
                   (newThread [_ r]
-                    (doto (Thread. ^Runnable r "audit-projector")
+                    (doto (Thread. ^Runnable r ^String thread-name)
                       (.setDaemon true)))))]
       (reset! state {:running? true :started-at (System/currentTimeMillis)
                      :failures 0})

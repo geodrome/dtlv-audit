@@ -1,0 +1,25 @@
+;; Two separate problems with datalevin.core's with-transaction, needing two
+;; separate entries:
+;;
+;; 1. It is published by `(datalevin.util/import-macro conn/with-transaction)`
+;;    rather than a `def`, so static analysis sees no var and reports every use
+;;    as unresolved. import-macro is potemkin's, near enough that clj-kondo's
+;;    built-in import-vars handling picks the imported vars up — all four of
+;;    datalevin.core's (with-transaction, with-transaction-kv, with-conn,
+;;    with-kv). Preferred over excluding datalevin.core from :unresolved-var,
+;;    which would also silence real typos like `d/no-such-fn`.
+;;    Needs the dependency cache: clj-kondo --lint "$(clojure -Spath)"
+;;    --dependencies --parallel --copy-configs
+;;
+;; 2. Knowing the var exists is not knowing it binds. Its binding vector is
+;;    `[tx conn]`, which with-open already models, so without this the bound
+;;    symbol reads as unresolved. (with-transaction also takes a third opts
+;;    element; lint-as would call that an odd binding count, but nothing here
+;;    uses that arity.)
+;; 3. Our own with-tx macros bind a symbol the same way, and are the supported
+;;    way to write inside a transaction — without these, every use reports the
+;;    bound symbol as unresolved.
+{:lint-as {datalevin.util/import-macro     potemkin/import-vars
+           datalevin.core/with-transaction clojure.core/with-open
+           dtlv-audit.journal/with-tx      clojure.core/with-open
+           dtlv-audit.core/with-tx         clojure.core/with-open}}

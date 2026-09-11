@@ -27,9 +27,11 @@
      (def store (open! {:dir \"data/domain\"
                         :audit-dir \"data/audit\"
                         :schema domain-schema
+                        :conn-opts {:auto-entity-time? true}
                         :annotations {:audit/actor  {:db/valueType :db.type/string}
                                       :audit/req-id {:db/valueType :db.type/string}
-                                      :audit/cmd    {:db/valueType :db.type/keyword}}}))
+                                      :audit/cmd    {:db/valueType :db.type/keyword}
+                                      :audit/op     {}}}))
      (def stop! (start-projector! store))
 
      (tx! store [{:quote/number \"Q-1042\" :quote/total 4500}]
@@ -37,6 +39,18 @@
 
      (history store 42)
      (by-annotation store :audit/req-id \"01J8X\")
+
+   An annotation declared with no :db/valueType — :audit/op above — is
+   untyped: it takes any value, stored as EDN and matchable by equality. That
+   is what carries a value with no scalar type, such as a command in the shape
+   [:entity/verb args].
+
+   Read-then-write needs one transaction across both halves. `with-tx` scopes
+   a store to one, and writes through the scoped store join it:
+
+     (with-tx [s store]
+       (when (ok? (d/q ... (db s)))
+         (tx! s tx-data {:audit/cmd :quote/create})))
 
    Reads take a plain conn — only writes need the store:
 
@@ -71,6 +85,19 @@
                 with :closed-schema?. When false, tx! warns and the audit DB
                 accepts undeclared annotations as EDN blobs.
 
+   :conn-opts   options for the *domain* conn, as passed to d/get-conn. These
+                are the caller's own — :auto-entity-time?, :validate-data?,
+                :closed-schema?, sizing — and this fn has no opinion on them.
+                Not defaulted: a store opened here must behave exactly as the
+                same store opened with d/get-conn directly, or journaling a
+                write would change the write.
+
+   :audit-conn-opts  the same for the audit conn, minus :closed-schema?, which
+                :strict? owns. Separate from :conn-opts because the two DBs
+                are shaped by different forces: the domain schema is the
+                caller's, while the audit schema is this library's plus the
+                declared annotations.
+
    Config validation lives downstream now — annotation types in
    `journal/open`, reserved namespaces and the shared-directory check in
    `projector/open` — so that it holds for anyone composing the two by hand,
@@ -79,18 +106,19 @@
    d/get-conn hands it back before rethrowing: a throw that stranded an
    environment nobody holds a handle to would, in-process, leave the directory
    locked for good."
-  [{:keys [dir audit-dir schema annotations strict?]
+  [{:keys [dir audit-dir schema annotations strict? conn-opts audit-conn-opts]
     :or   {annotations {}}}]
-  (let [conn (d/get-conn dir schema)
+  (let [conn (d/get-conn dir schema conn-opts)
         j    (try
                (journal/open conn {:annotations annotations :strict? strict?})
                (catch Throwable t
                  (d/close conn)
                  (throw t)))
         p    (try
-               (projector/open j {:dir audit-dir})
+               (projector/open j {:dir audit-dir :conn-opts audit-conn-opts})
                (catch Throwable t
-                 (journal/close! j)
+                 ;; The journal holds nothing to release — closing the domain
+                 ;; conn is the whole unwind. See `dtlv-audit.journal`.
                  (d/close conn)
                  (throw t)))]
     {:conn conn :journal j :projector p}))
@@ -102,12 +130,14 @@
    closed either way, since the caller asked, but a drain outliving the
    environment it writes to is worth surfacing rather than swallowing.
 
+   Two things close, not three: the journal holds nothing to release, its KV
+   handle being borrowed from `conn`.
+
    Order matters: the projector goes down first because a drain in flight
-   reads the journal, and the domain conn goes last because the journal's KV
-   handle is borrowed from it."
-  [{:keys [conn journal projector]}]
+   reads the journal, and the domain conn goes last because that handle is
+   borrowed from it."
+  [{:keys [conn projector]}]
   (let [stopped (projector/close! projector)]
-    (journal/close! journal)
     (d/close conn)
     stopped))
 
@@ -126,6 +156,28 @@
    transaction. See `dtlv-audit.journal/tx!`."
   ([store tx-data] (journal/tx! (:journal store) tx-data nil))
   ([store tx-data tx-meta] (journal/tx! (:journal store) tx-data tx-meta)))
+
+(defmacro with-tx
+  "Runs `body` with `bound` set to `store` scoped to one transaction: its
+   journal rebound, and `db` reading the transaction's own uncommitted
+   writes. See `dtlv-audit.journal/with-tx`.
+
+     (with-tx [s store]
+       (when (ok? (d/q ... (db s)))
+         (tx! s tx-data {:audit/cmd :quote/create})))"
+  [[bound store] & body]
+  `(let [s# ~store]
+     (journal/with-tx [j# (:journal s#)]
+       (let [~bound (assoc s# :journal j# :conn (journal/conn j#))]
+         ~@body))))
+
+(defn clear-journal!
+  "DESTRUCTIVE: empties the journal. See `dtlv-audit.journal/clear!`.
+
+   Leaves the audit DB describing entries that no longer exist — `rebuild!`
+   is what reconciles the two, and after this it empties the projection."
+  [store]
+  (journal/clear! (:journal store)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Projection

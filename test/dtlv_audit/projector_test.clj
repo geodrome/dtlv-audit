@@ -23,14 +23,13 @@
 (defn- with-parts
   "Journal and projector assembled by hand; calls (f conn journal projector),
    then closes in the order the docstrings require: projector down first,
-   domain conn last."
+   domain conn last. The journal is not closed — it holds nothing to release."
   [f]
   (let [conn (d/get-conn (tmpdir) domain-schema)
         j    (journal/open conn {:annotations annotations})
         p    (projector/open j {:dir (tmpdir)})]
     (try (f conn j p)
          (finally (projector/close! p)
-                  (journal/close! j)
                   (d/close conn)))))
 
 (deftest hand-composed-projection-test
@@ -131,7 +130,7 @@
       (try
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved namespaces"
                               (projector/open j {:dir (tmpdir)})))
-        (finally (journal/close! j) (d/close conn)))))
+        (finally (d/close conn)))))
 
   (testing "the journal alone has no reserved namespaces"
     (let [conn (d/get-conn (tmpdir) domain-schema)
@@ -139,7 +138,7 @@
       (try
         (journal/tx! j [{:quote/number "Q-1"}] {:tx/id 99})
         (is (= {:tx/id 99} (-> (journal/entries-from j 0 10) first second :tx-meta)))
-        (finally (journal/close! j) (d/close conn)))))
+        (finally (d/close conn)))))
 
   (testing "the audit DB cannot share the domain directory"
     (let [dir  (tmpdir)
@@ -151,4 +150,54 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot share a directory"
                               (projector/open j {:dir (str dir "/")}))
             "trailing slash is the same directory")
-        (finally (journal/close! j) (d/close conn))))))
+        (finally (d/close conn))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Thread naming and audit conn-opts
+
+(defn- thread-named? [name]
+  (some #(= name (.getName ^Thread %)) (keys (Thread/getAllStackTraces))))
+
+(deftest thread-name-test
+  (testing "the projector thread takes the name it is given"
+    (with-parts
+      (fn [_conn _j p]
+        (let [stop! (projector/start! p {:interval-ms 20
+                                         :thread-name "audit-projector:tenant-7"})]
+          (try
+            (is (thread-named? "audit-projector:tenant-7")
+                "a process running one projector per store needs them told apart
+                 from the outside — in a thread dump or a profiler")
+            (finally (stop!)))))))
+
+  (testing "and defaults to audit-projector when not given one"
+    (with-parts
+      (fn [_conn _j p]
+        (let [stop! (projector/start! p {:interval-ms 20})]
+          (try (is (thread-named? "audit-projector"))
+               (finally (stop!))))))))
+
+(deftest audit-conn-opts-test
+  (testing ":conn-opts reach the audit conn"
+    (let [conn (d/get-conn (tmpdir) domain-schema)
+          j    (journal/open conn {:annotations annotations})
+          p    (projector/open j {:dir (tmpdir) :conn-opts {:auto-entity-time? true}})]
+      (try
+        (journal/tx! j [{:quote/number "Q-1"}] {:audit/actor "geo"})
+        (projector/catch-up! p)
+        (is (seq (d/q '[:find [?t ...] :where [?t :db/created-at _]]
+                      (projector/db p)))
+            "audit entities carry :db/created-at, so the option took effect")
+        (finally (projector/close! p) (d/close conn)))))
+
+  (testing ":closed-schema? stays :strict?'s to set, not the caller's"
+    (let [conn (d/get-conn (tmpdir) domain-schema)
+          j    (journal/open conn {:annotations annotations :strict? true})
+          ;; a caller trying to loosen the audit DB behind strict?'s back
+          p    (projector/open j {:dir (tmpdir) :conn-opts {:closed-schema? false}})]
+      (try
+        (is (thrown? Exception
+                     (d/transact! @(:audit p) [{:not/declared "x"}]))
+            "still closed — the two would otherwise be one setting with two
+             sources, silently disagreeing")
+        (finally (projector/close! p) (d/close conn))))))
