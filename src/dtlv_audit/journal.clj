@@ -287,6 +287,7 @@
                           {:commit       commit
                            :tx-data      (mapv (juxt :e :a :v :added) (:tx-data report))
                            :tx-meta      meta
+                           ;; TODO: use :db/updated-at
                            :tx-timestamp (System/currentTimeMillis)
                            :new-attrs    (vec (:new-attributes report))}
                           :long :data]])
