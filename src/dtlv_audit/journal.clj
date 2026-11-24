@@ -1,5 +1,5 @@
 (ns dtlv-audit.journal
-  "Durable transaction journal for an embedded Datalevin store.
+  "Durable transaction journal for a Datalevin store, embedded or on a server.
 
    Datalevin keeps no history: when data is retracted it is gone. The journal
    is the record of what was there. `tx!` writes the transaction report to a
@@ -51,12 +51,19 @@
    `:tx-timestamp` is wall clock, for correlating with application logs only;
    never sort by it.
 
-   Embedded Datalevin only. The atomicity above comes from the journal living
-   in the domain conn's own LMDB environment, reached through `d/datalog-kv`.
-   In Datalevin's words, it \"only works for DBIs that live in the same local
-   Datalevin store; it is not a cross-file transaction mechanism.\" A remote
-   store (a dtlv:// URI) cannot provide the handle at all, and `open` rejects
-   it rather than let a domain write commit without its journal entry."
+   The atomicity above comes from the journal living in the domain conn's own
+   LMDB environment, reached through `d/datalog-kv`. It is one environment and
+   one write transaction, never a transaction spanning two stores.
+
+   That holds on a server too. With a dtlv:// domain conn the environment and
+   the write transaction live on the server, and `d/datalog-kv` of the
+   transaction-bound conn is a remote KV view that joins the server-side
+   transaction — so the domain write and the journal put still commit or roll
+   back together. Datalevin added this between 1.1.0 and 1.2.11; on a version
+   without it the remote store has no KV interface, and `open` rejects it
+   rather than let a domain write commit without its journal entry. One thing
+   does differ: with the domain DB on a server, domain writes depend on that
+   server being up."
   (:require [datalevin.core :as d]
             [taoensso.trove :as trove])
   (:import [java.lang AutoCloseable]))
@@ -157,15 +164,18 @@
     (try
       ;; d/open-dbi is idempotent so this is safe on every store open
       ;;
-      ;; A remote store fails with an AbstractMethodError: its store type implements
-      ;; almost none of the KV interface. Rejected here rather than
-      ;; left to surface at the first write.
+      ;; On a Datalevin too old to give a remote store a KV view, d/datalog-kv
+      ;; hands back the remote Datalog store itself, which implements almost
+      ;; none of the KV interface and fails with an AbstractMethodError.
+      ;; Rejected here rather than left to surface at the first write. Kept
+      ;; because consumers pin their own Datalevin version — see deps.edn.
       (d/open-dbi kv journal-dbi)
       (catch AbstractMethodError e
-        (throw (ex-info (str "journal requires an embedded Datalevin store — "
-                             "this connection cannot host a KV sub-database, "
-                             "so a domain write could commit without its "
-                             "journal entry")
+        (throw (ex-info (str "journal cannot host its KV sub-database on this "
+                             "connection, so a domain write could commit "
+                             "without its journal entry — a dtlv:// domain "
+                             "DB needs a Datalevin whose d/datalog-kv supports "
+                             "remote stores (1.2.11 is tested)")
                         {:store (.getName (class kv))}
                         e))))
     {:conn        conn

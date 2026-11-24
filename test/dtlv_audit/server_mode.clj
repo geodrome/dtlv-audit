@@ -8,18 +8,24 @@
 
    What server mode means for this library, and what the blocks show:
 
-     1. The domain DB cannot live on a server. The journal shares the domain
-        write's LMDB transaction, and a remote conn has no KV handle to share —
-        `journal/open` and `core/open!` reject a dtlv:// domain :dir.
+     1. The domain DB can live on a server. The journal shares the domain
+        write's LMDB transaction, and on a server that transaction is held
+        server-side; `d/datalog-kv` of the transaction-bound conn joins it.
+        A throw rolls back the domain write and its journal entry together,
+        exactly as embedded. Needs a Datalevin with remote `d/datalog-kv`
+        (1.2.11 is tested); older ones are rejected by `journal/open`.
+        `dtlv-audit.server-test` asserts all of this; block 1 is the tour.
 
-     2. The audit DB can. It is a separate conn opened from :audit-dir, and a
-        dtlv:// URI there works end to end: projection, queries, rebuild!,
-        strict/non-strict schema, restart.
+     2. So can the audit DB. It is a separate conn opened from :audit-dir, and
+        a dtlv:// URI there works end to end: projection, queries, rebuild!,
+        strict/non-strict schema, restart. Blocks 2-4 pair it with an
+        embedded domain DB, which keeps the write path off the network.
 
-     3. What happens when the audit server goes away: domain writes carry on,
-        the projector backs off — but `projector-status` throws, and the
-        Datalevin client never reconnects, so recovery is `rebuild!` or a
-        close!/open! of the store."
+     3. What happens when the audit server goes away: with an embedded domain
+        DB, domain writes carry on and the projector backs off — but
+        `projector-status` throws, and the Datalevin client never reconnects,
+        so recovery is `rebuild!` or a close!/open! of the store. (With the
+        domain DB on that server too, domain writes stop with it.)"
   (:require [datalevin.core :as d]
             [datalevin.server :as srv]
             [dtlv-audit.core :as core]
@@ -95,32 +101,50 @@
   (timbre/set-min-level! :warn))
 
 ;;; ---------------------------------------------------------------------------
-;;; 1. Domain DB on the server is rejected
+;;; 1. Domain DB on the server
 
 (comment
-  ;; journal/open: the remote store cannot host the journal's KV sub-database.
-  (let [conn (d/get-conn (uri "domain-1") schema)]
-    (try (journal/open conn {:annotations annotations})
-         (catch Exception e
-           [(ex-message e) (ex-data e) (class (ex-cause e))])
-         (finally (d/close conn))))
-  ;; => ["journal requires an embedded Datalevin store — ..."
-  ;;     {:store "datalevin.remote.DatalogStore"}
-  ;;     java.lang.AbstractMethodError]
+  (def conn (d/get-conn (uri "domain-1") schema))
 
-  ;; core/open!: same rejection, and the remote conn is closed on the way out.
-  (try (core/open! {:dir         (uri "domain-1")
-                    :audit-dir   (tmpdir "audit-1")
-                    :schema      schema
-                    :annotations annotations})
+  ;; The KV handle is a remote view onto the same server-side environment,
+  ;; not the Datalog store itself (which is what Datalevin 1.1.0 returned).
+  (class (d/datalog-kv conn))
+  ;; => datalevin.remote.KVStore
+
+  (def j (journal/open conn {:annotations annotations}))
+
+  (journal/tx! j [{:quote/number "Q-1" :quote/total 10}] {:audit/actor "geo"})
+  ;; => {... :tx 2 :commit 2}
+
+  ;; Two writes, then a throw. Both journal puts reach the server before the
+  ;; throw; only a shared server-side transaction can take them back.
+  (try (journal/with-tx [jj j]
+         (journal/tx! jj [{:quote/number "Q-2" :quote/total 20}] {:audit/actor "geo"})
+         (journal/tx! jj [{:quote/number "Q-3" :quote/total 30}] {:audit/actor "geo"})
+         (throw (ex-info "boom" {})))
        (catch Exception e (ex-message e)))
+  ;; => "boom"
 
-  ;; Proof nothing was stranded: the same remote DB opens and closes cleanly.
-  (let [c (d/get-conn (uri "domain-1") schema)]
-    (d/close c)))
+  (d/q '[:find ?n :where [_ :quote/number ?n]] (d/db conn))
+  ;; => #{["Q-1"]}
+  (map first (journal/entries-from j 0 100))
+  ;; => (2) — and the rolled-back transaction used no tx ids
+
+  (d/close conn)
+
+  ;; The whole store on the server: domain and audit DBs both dtlv:// URIs.
+  (def store (core/open! {:dir         (uri "domain-1b")
+                          :audit-dir   (uri "audit-1b")
+                          :schema      schema
+                          :annotations annotations}))
+  (core/tx! store [{:quote/number "Q-1" :quote/total 100}] {:audit/actor "geo"})
+  (core/catch-up! store)
+  ;; => 1
+  (core/by-annotation store :audit/actor "geo")
+  (core/close! store))
 
 ;;; ---------------------------------------------------------------------------
-;;; 2. Audit DB on the server — the supported server-mode layout
+;;; 2. Audit DB on the server, domain DB embedded
 
 (comment
   (def store

@@ -89,6 +89,21 @@ everything that used to be there. `clear-journal!` is what empties it; deleting
 the store directory takes it too. The audit DB is derived, so `rebuild!` is
 what reconciles a projection with a journal that was cleared.
 
+### Server mode
+
+`:dir` and `:audit-dir` each take a directory or a `dtlv://` URI, in any
+combination. A domain DB on a server keeps the same guarantee: the write
+transaction is held server-side, and the journal put joins it, so a domain
+write and its journal entry still commit or roll back together. That needs a
+Datalevin whose remote `d/datalog-kv` joins the transaction; 1.2.11 is tested,
+and 1.1.0 lacks it, so the journal refuses to open on a remote domain DB there.
+
+With the domain DB embedded and only the audit DB on a server, domain writes
+never touch the network, and keep going if the server is down. The projector
+waits; recover it with `rebuild!`, since the Datalevin client does not
+reconnect. `test/dtlv_audit/server_mode.clj` walks through each layout at the
+REPL.
+
 ### Required JVM options
 
 Datalevin needs these on JDK 17+ (they are set for you in the `:dev` and

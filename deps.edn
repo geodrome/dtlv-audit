@@ -5,7 +5,7 @@
  ;; whichever Datalevin version they already run.
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
-  datalevin/datalevin {:mvn/version "1.1.0"}
+  datalevin/datalevin {:mvn/version "1.2.11"}
   ;; Logging facade, not a backend: as a library we emit structured logs
   ;; without forcing a logging choice on consumers. Trove defaults to *out*
   ;; and they can point it at Telemere/Timbre/SLF4J via trove/set-log-fn!.

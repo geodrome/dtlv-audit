@@ -20,7 +20,9 @@
                            audit DB, no projector and no background thread
      dtlv-audit.projector  the derived audit DB following a journal
 
-   Embedded Datalevin only; see `dtlv-audit.journal`.
+   Either DB may be embedded or on a Datalevin server (a dtlv:// URI for :dir
+   or :audit-dir). A server-hosted domain DB keeps the same atomicity; see
+   `dtlv-audit.journal` for how, and for the Datalevin version it needs.
 
    Usage:
 
@@ -65,8 +67,8 @@
 (defn open!
   "Opens a store: a domain conn, a journal on it, and an audit projection.
 
-   :dir         domain DB directory
-   :audit-dir   audit DB directory — must not resolve to :dir
+   :dir         domain DB directory, or a dtlv:// URI
+   :audit-dir   audit DB directory or dtlv:// URI — must not resolve to :dir
    :schema      domain schema, as passed to d/get-conn
    :annotations vocabulary callers may pass as tx-meta, in ordinary Datalevin
                 schema shape:
